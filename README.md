@@ -74,6 +74,9 @@ add element inet blocklists blocklist_ipv4 {
 
 ```bash
 #!/usr/sbin/nft -f
+
+flush ruleset
+#...
 include "/etc/nftables.d/*.nft"
 ```
 

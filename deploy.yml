@@ -1,0 +1,29 @@
+- name: Deploy nftables block‑list from $DIR and apply changes
+  hosts: all
+  become: true
+  vars:
+      blocklist_src: "{{ lookup('env', 'DIR') }}/20-blocklist-ipv4.nft"
+
+      blocklist_dest: /etc/nftables.d/20-blocklist-ipv4.nft
+      nft_conf: /etc/nftables.conf
+
+  tasks:
+      - name: Ensure target directory exists
+        file:
+            path: /etc/nftables.d
+            state: directory
+            owner: root
+            group: root
+            mode: "0755"
+
+      - name: Copy block‑list nft file from $DIR
+        copy:
+            src: "{{ blocklist_src }}"
+            dest: "{{ blocklist_dest }}"
+            owner: root
+            group: root
+            mode: "0644"
+
+      - name: Apply nftables configuration
+        command:
+            cmd: nft -f "{{ nft_conf }}"
