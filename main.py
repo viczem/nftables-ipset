@@ -161,13 +161,15 @@ def read_interactive() -> Set[str]:
             break
 
         line = line.strip()
-        try:
-            ip = validate_ip_v4(line)
-        except ValueError as e:
-            print(f"{e} – line ignored")
-            continue
+        tokens = [_.strip() for _ in line.replace(",", " ").split() if _.strip()]
+        for token in tokens:
+            try:
+                ip = validate_ip_v4(token)
+            except ValueError as e:
+                print(f"{e} – line ignored")
+                continue
+            rows.add(ip)
 
-        rows.add(ip)
     return rows
 
 
