@@ -47,10 +47,39 @@ def export_blocklist(
             …
         }
     """
+
+    # ------------------------------------------------------------------
+    # 1. Load everything from the DB (both plain IPs and CIDR blocks)
+    # ------------------------------------------------------------------
     rows = conn.execute(  # sql
         "SELECT ip FROM ipv4_addresses ORDER BY ip;"
     ).fetchall()
-    ips = [row[0] for row in rows]
+    subnets: list[ipaddress.IPv4Network] = []
+    hosts: list[str] = []
+
+    for (ip_str,) in rows:
+        if "/" in ip_str:  # treat it as a network
+            try:
+                subnets.append(ipaddress.IPv4Network(ip_str, strict=False))
+            except Exception as exc:
+                raise ValueError(f"Invalid CIDR entry in DB: {ip_str}") from exc
+        else:  # plain host address
+            hosts.append(ip_str)
+
+    # ---------------------------------------------------------------
+    # 2. Drop every host that belongs to *any* of the collected nets
+    # ---------------------------------------------------------------
+    filtered_hosts = [
+        h for h in hosts if not any(ipaddress.IPv4Address(h) in net for net in subnets)
+    ]
+
+    # ---------------------------------------------------------------
+    # 3. Build the final, ordered list.
+    # ---------------------------------------------------------------
+    # Convert the network objects back to their canonical string form.
+    subnet_strs = [str(net) for net in subnets]
+
+    ips = sorted(subnet_strs, reverse=True) + sorted(filtered_hosts, reverse=True)
 
     with open(output_path, "w", encoding="utf-8") as f:
         f.write("add element inet blocklists blocklist_ipv4 {\n")
@@ -59,6 +88,7 @@ def export_blocklist(
             suffix = "," if i < len(ips) - 1 else ""
             f.write(f"    {ip}{suffix}\n")
         f.write("}\n")
+
     print(f"Blocklist exported to {output_path}")
 
 
@@ -176,10 +206,10 @@ def read_interactive() -> Set[str]:
 def validate_ip_v4(ip_str: str) -> str:
     """Raise ValueError if `ip_str` is not a valid IPv4 address."""
     try:
-        ipaddress.IPv4Address(ip_str)
+        ipaddress.IPv4Network(ip_str, strict=False)
         return ip_str
-    except ipaddress.AddressValueError as exc:
-        raise ValueError(f"Invalid IPv4 address: {ip_str}") from exc
+    except (ipaddress.AddressValueError, ipaddress.NetmaskValueError) as exc:
+        raise ValueError(f"Invalid IPv4 address or network: {ip_str}") from exc
 
 
 def main():
