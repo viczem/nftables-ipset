@@ -10,9 +10,7 @@ if "DIR" in os.environ:
     DIR = Path(os.environ["DIR"]).expanduser().resolve()
 else:
     DIR = Path(__file__).resolve().parent
-    # Ensure the directory exists before we try to write files inside it.
     DIR.mkdir(parents=True, exist_ok=True)
-    # The SQLite database file lives inside ``DIR``.
 
 DB_PATH = DIR / "nftables-ipset.db"
 
