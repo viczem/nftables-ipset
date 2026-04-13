@@ -4,7 +4,10 @@ import os
 import sqlite3
 import sys
 from pathlib import Path
-from typing import Optional, Set
+
+# ---------------------------------------------------------------------------
+# Configuration
+# ---------------------------------------------------------------------------
 
 if "DIR" in os.environ:
     DIR = Path(os.environ["DIR"]).expanduser().resolve()
@@ -15,207 +18,405 @@ else:
 DB_PATH = DIR / "nftables-ipset.db"
 
 
-def init_db(conn: sqlite3.Connection):
-    """Create the table (if missing) and apply performance‑oriented PRAGMAs."""
-    conn.execute(  # sql
+# ---------------------------------------------------------------------------
+# Database schema & helpers
+# ---------------------------------------------------------------------------
+
+
+def init_db(conn: sqlite3.Connection) -> None:
+    """Create the required tables and set SQLite pragmas.
+
+    Two tables are used:
+
+    * ``ip_addresses`` – stores individual host IPs.
+    * ``ip_networks`` – stores network prefixes. The ``ip`` column stores the
+      network address (e.g. ``158.94.208.0``) and ``subnet`` stores the prefix
+      length (e.g. ``24``). ``updated_at`` is refreshed when the stored prefix
+      is expanded (e.g. from ``/24`` to ``/22``).
+
+    The function is idempotent – it can be called on every start‑up.
+    """
+    # Hosts
+    conn.execute(
         """
-        CREATE TABLE IF NOT EXISTS ipv4_addresses (
+        CREATE TABLE IF NOT EXISTS ip_addresses (
             ip         TEXT    NOT NULL UNIQUE,
+            version    TEXT    NOT NULL,   -- 'ipv4' or 'ipv6'
             created_at DATETIME DEFAULT (datetime('now')) NOT NULL,
             metadata   TEXT
         );
         """
     )
-
+    # Networks
+    conn.execute(
+        """
+        CREATE TABLE IF NOT EXISTS ip_networks (
+            ip         TEXT    NOT NULL,
+            version    TEXT    NOT NULL,   -- 'ipv4' or 'ipv6'
+            subnet     INTEGER NOT NULL,   -- prefix length
+            created_at DATETIME DEFAULT (datetime('now')) NOT NULL,
+            updated_at DATETIME DEFAULT (datetime('now')) NOT NULL,
+            PRIMARY KEY (ip, version)
+        );
+        """
+    )
+    # Performance‑oriented pragmas
     conn.execute("PRAGMA journal_mode=WAL;")
     conn.execute("PRAGMA synchronous=NORMAL;")
 
 
-def export_blocklist(
-    conn: sqlite3.Connection,
-    output_path: Path = DIR / "20-blocklist-ipv4.nft",
+def _insert_network(conn: sqlite3.Connection, net_str: str, version: str) -> None:
+    net = ipaddress.ip_network(net_str, strict=False)
+    base_ip = str(net.network_address)
+    prefix = net.prefixlen
+
+    cur = conn.cursor()
+
+    # Check if the new network is already covered by an existing broader network
+    cur.execute("SELECT ip, subnet FROM ip_networks WHERE version = ?;", (version,))
+    existing_rows = cur.fetchall()
+    for existing_ip, existing_prefix in existing_rows:
+        existing_net = ipaddress.ip_network(
+            f"{existing_ip}/{existing_prefix}", strict=False
+        )
+        if (
+            net.version == existing_net.version
+            and int(existing_net.network_address) <= int(net.network_address)
+            and int(existing_net.broadcast_address) >= int(net.broadcast_address)
+        ):
+            print(
+                f"Ignored network {base_ip}/{prefix}; covered by existing {existing_ip}/{existing_prefix} ({version})"
+            )
+            conn.commit()
+            return
+
+    # Delete any existing networks that are subnets of the new network (more specific)
+    for existing_ip, existing_prefix in existing_rows:
+        existing_net = ipaddress.ip_network(
+            f"{existing_ip}/{existing_prefix}", strict=False
+        )
+        if (
+            net.version == existing_net.version
+            and int(existing_net.network_address) >= int(net.network_address)
+            and int(existing_net.broadcast_address) <= int(net.broadcast_address)
+        ):
+            cur.execute(
+                "DELETE FROM ip_networks WHERE ip = ? AND version = ?;",
+                (existing_ip, version),
+            )
+
+    # Insert or update the exact network entry
+    cur.execute(
+        "SELECT subnet FROM ip_networks WHERE ip = ? AND version = ?;",
+        (base_ip, version),
+    )
+    row = cur.fetchone()
+    if row is None:
+        cur.execute(
+            "INSERT INTO ip_networks (ip, version, subnet) VALUES (?, ?, ?);",
+            (base_ip, version, prefix),
+        )
+        conn.commit()
+        print(f"Inserted network {base_ip}/{prefix} ({version})")
+    else:
+        existing = row[0]
+        if prefix < existing:
+            cur.execute(
+                """
+                UPDATE ip_networks
+                SET subnet = ?, updated_at = datetime('now')
+                WHERE ip = ? AND version = ?;
+                """,
+                (prefix, base_ip, version),
+            )
+            conn.commit()
+            print(
+                f"Updated network {base_ip}/{existing} -> {base_ip}/{prefix} ({version})"
+            )
+        else:
+            print(
+                f"Ignored network {base_ip}/{prefix}; existing /{existing} is broader."
+            )
+
+
+# ---------------------------------------------------------------------------
+# Validation helpers
+# ---------------------------------------------------------------------------
+
+
+def validate_ip(ip_str: str) -> tuple[str, str]:
+    """
+    Validate any IPv4 or IPv6 address/network.
+    Returns a tuple ``(original_input, version)`` where ``version`` is ``ipv4``
+    or ``ipv6``. ``ipaddress.ip_network`` is used with ``strict=False`` so that
+    both hosts (e.g. ``1.2.3.4``) and networks (e.g. ``1.2.3.0/24``) are accepted.
+    """
+    try:
+        net = ipaddress.ip_network(ip_str, strict=False)
+    except (ipaddress.AddressValueError, ipaddress.NetmaskValueError) as exc:
+        raise ValueError(f"Invalid IP address or network: {ip_str}") from exc
+
+    version = "ipv4" if net.version == 4 else "ipv6"
+    return ip_str, version
+
+
+# ---------------------------------------------------------------------------
+# CRUD operations
+# ---------------------------------------------------------------------------
+
+
+def insert_ip(
+    conn: sqlite3.Connection, ip: str, version: str, metadata: str | None
 ) -> None:
     """
-    Export every stored IPv4 address to a file suitable for inclusion in an
-    nftables configuration.  The file will contain:
-
-        add element inet blocklists blocklist_ipv4 {
-            1.2.3.4,
-            5.6.7.8,
-            …
-        }
+    Insert a host IP or delegate to ``_insert_network`` when a CIDR is supplied.
     """
-
-    # ------------------------------------------------------------------
-    # 1. Load everything from the DB (both plain IPs and CIDR blocks)
-    # ------------------------------------------------------------------
-    rows = conn.execute(  # sql
-        "SELECT ip FROM ipv4_addresses ORDER BY ip;"
-    ).fetchall()
-    subnets: list[ipaddress.IPv4Network] = []
-    hosts: list[str] = []
-
-    for (ip_str,) in rows:
-        if "/" in ip_str:  # treat it as a network
-            try:
-                subnets.append(ipaddress.IPv4Network(ip_str, strict=False))
-            except Exception as exc:
-                raise ValueError(f"Invalid CIDR entry in DB: {ip_str}") from exc
-        else:  # plain host address
-            hosts.append(ip_str)
-
-    # ---------------------------------------------------------------
-    # 2. Drop every host that belongs to *any* of the collected nets
-    # ---------------------------------------------------------------
-    filtered_hosts = [
-        h for h in hosts if not any(ipaddress.IPv4Address(h) in net for net in subnets)
-    ]
-
-    # ---------------------------------------------------------------
-    # 3. Build the final, ordered list.
-    # ---------------------------------------------------------------
-    # Convert the network objects back to their canonical string form.
-    subnet_strs = [str(net) for net in subnets]
-
-    ips = sorted(subnet_strs, reverse=True) + sorted(filtered_hosts, reverse=True)
-
-    with open(output_path, "w", encoding="utf-8") as f:
-        f.write("add element inet blocklists blocklist_ipv4 {\n")
-        for i, ip in enumerate(ips):
-            # Append a comma after every entry except the last one
-            suffix = "," if i < len(ips) - 1 else ""
-            f.write(f"    {ip}{suffix}\n")
-        f.write("}\n")
-
-    print(f"Blocklist exported to {output_path}")
-
-
-def insert_ip4(conn: sqlite3.Connection, ip: str, metadata: Optional[str]):
-    """Insert a new IPv4 address with optional comment metadata."""
+    if "/" in ip:
+        _insert_network(conn, ip, version)
+        return
 
     cur = conn.cursor()
     try:
-        cur.execute(  # sql
-            "INSERT OR IGNORE INTO ipv4_addresses (ip, metadata) VALUES (?, ?);",
-            (ip, metadata),
+        cur.execute(
+            "INSERT OR IGNORE INTO ip_addresses (ip, version, metadata) VALUES (?, ?, ?);",
+            (ip, version, metadata),
         )
         conn.commit()
-        print(f"Inserted {ip}")
+        print(f"Inserted {ip} ({version})")
     except sqlite3.IntegrityError:
         print(f"IP {ip} already exists – not inserted.")
 
 
-def batch_insert_ip4(conn: sqlite3.Connection, rows: Set[str], metadata: Optional[str]):
+def batch_insert_ip(
+    conn: sqlite3.Connection, rows: set[str], metadata: str | None
+) -> int:
     """
-    Insert the given rows in a single transaction.
-    Returns the number of rows actually inserted (duplicates are ignored).
+    Insert many entries. Networks are handled individually (because they need
+    conditional upserts) while plain hosts are bulk‑inserted for speed.
+    Returns the number of rows affected according to SQLite's ``total_changes``.
     """
     if not rows:
         return 0
 
-    conn.execute("BEGIN;")
+    hosts_to_insert: list[tuple[str, str]] = []
 
-    try:
-        conn.executemany(  # sql
-            "INSERT OR IGNORE INTO ipv4_addresses (ip, metadata) VALUES (?, ?);",
-            ((_, metadata) for _ in rows),
-        )
-    except sqlite3.DatabaseError as e:
-        conn.rollback()
-        raise RuntimeError(f"Batch insert failed: {e}") from e
-    else:
-        conn.commit()
+    for raw in rows:
+        try:
+            ip_norm, ver = validate_ip(raw)
+        except ValueError as e:
+            print(f"{e} – line ignored")
+            continue
+
+        if "/" in ip_norm:
+            _insert_network(conn, ip_norm, ver)
+        else:
+            hosts_to_insert.append((ip_norm, ver))
+
+    # Bulk insert hosts
+    if hosts_to_insert:
+        conn.execute("BEGIN;")
+        try:
+            conn.executemany(
+                "INSERT OR IGNORE INTO ip_addresses (ip, version, metadata) VALUES (?, ?, ?);",
+                ((ip, ver, metadata) for ip, ver in hosts_to_insert),
+            )
+        except sqlite3.DatabaseError as e:
+            conn.rollback()
+            raise RuntimeError(f"Batch insert failed: {e}") from e
+        else:
+            conn.commit()
 
     inserted = conn.execute("SELECT total_changes();").fetchone()[0]
     print(f"Inserted {inserted}")
+    return inserted
 
 
-def remove_ip4(conn: sqlite3.Connection, ip: str):
-    """Delete a single IPv4 address."""
+# ---------------------------------------------------------------------------
+# Updated CRUD helpers – these definitions replace the earlier versions.
+# ---------------------------------------------------------------------------
+
+
+def remove_ip(conn: sqlite3.Connection, ip: str) -> None:
+    """Delete a host IP *or* a network.
+
+    The function validates the supplied ``ip`` (which may be a plain address or a
+    CIDR network) using :func:`validate_ip`.  If the string contains a ``/`` it
+    is treated as a network and the entry is removed from ``ip_networks`` using
+    the *network address* (base IP).  Otherwise the entry is a host and is
+    removed from ``ip_addresses``.
+    """
+    ip_norm, version = validate_ip(ip)
+
     cur = conn.cursor()
-    cur.execute(  # sql
-        "DELETE FROM ipv4_addresses WHERE ip = ?;", (ip,)
-    )
-    conn.commit()
-    if cur.rowcount:
-        print(f"Removed {ip}")
+    if "/" in ip_norm:
+        net = ipaddress.ip_network(ip_norm, strict=False)
+        base_ip = str(net.network_address)
+        cur.execute(
+            "DELETE FROM ip_networks WHERE ip = ? AND version = ?;",
+            (base_ip, version),
+        )
+        conn.commit()
+        if cur.rowcount:
+            print(f"Removed network {base_ip}/{net.prefixlen} ({version})")
+        else:
+            print(
+                f"Network {base_ip}/{net.prefixlen} ({version}) not found – nothing removed."
+            )
     else:
-        print(f"IP {ip} not found – nothing removed.")
+        cur.execute(
+            "DELETE FROM ip_addresses WHERE ip = ? AND version = ?;",
+            (ip_norm, version),
+        )
+        conn.commit()
+        if cur.rowcount:
+            print(f"Removed {ip_norm} ({version})")
+        else:
+            print(f"{ip_norm} ({version}) not found – nothing removed.")
 
 
-def batch_remove_ip4(conn: sqlite3.Connection, rows: Set[str]):
-    """Delete many IPv4 addresses in a single transaction."""
+def batch_remove_ip(conn: sqlite3.Connection, rows: set[str]) -> int:
+    """Bulk delete of host IPs **and** CIDR networks.
+
+    Each entry is validated with :func:`validate_ip`.  Networks are identified
+    by the presence of a ``/`` and are removed from ``ip_networks`` using the
+    network address.  Hosts are removed from ``ip_addresses``.  The function
+    returns the total number of rows removed across both tables.
+    """
     if not rows:
         return 0
 
+    hosts_to_delete: list[tuple[str, str]] = []
+    nets_to_delete: list[tuple[str, str]] = []
+
+    for raw in rows:
+        try:
+            ip_norm, ver = validate_ip(raw)
+        except ValueError as e:
+            print(f"{e} – line ignored")
+            continue
+
+        if "/" in ip_norm:
+            net = ipaddress.ip_network(ip_norm, strict=False)
+            base_ip = str(net.network_address)
+            nets_to_delete.append((base_ip, ver))
+        else:
+            hosts_to_delete.append((ip_norm, ver))
+
     conn.execute("BEGIN;")
     try:
-        conn.executemany(  # sql
-            "DELETE FROM ipv4_addresses WHERE ip = ?;",
-            ((ip,) for ip in rows),
-        )
+        if hosts_to_delete:
+            conn.executemany(
+                "DELETE FROM ip_addresses WHERE ip = ? AND version = ?;",
+                hosts_to_delete,
+            )
+        if nets_to_delete:
+            conn.executemany(
+                "DELETE FROM ip_networks WHERE ip = ? AND version = ?;",
+                nets_to_delete,
+            )
     except sqlite3.DatabaseError as e:
         conn.rollback()
         raise RuntimeError(f"Batch remove failed: {e}") from e
     else:
         conn.commit()
 
-    removed = conn.execute("SELECT total_changes();").fetchone()[0]
-    print(f"Removed {removed}")
+    total_removed = conn.execute("SELECT total_changes();").fetchone()[0]
+    print(f"Removed {total_removed}")
+    return total_removed
 
 
-def read_interactive() -> Set[str]:
+# ---------------------------------------------------------------------------
+# Export logic
+# ---------------------------------------------------------------------------
+
+
+def _export_one_family(
+    conn: sqlite3.Connection, family: str, output_path: Path
+) -> None:
     """
-    Read lines from stdin until an **empty line** or **EOF** is encountered.
-    Returns a set of validated ip.
+    Export a single address family (``ipv4`` or ``ipv6``) to a nftables set file.
+    Hosts are taken from ``ip_addresses``; networks are reconstructed from
+    ``ip_networks``.
     """
-    rows: Set[str] = set()
+    # Hosts
+    host_rows = conn.execute(
+        "SELECT ip FROM ip_addresses WHERE version = ? ORDER BY ip;",
+        (family,),
+    ).fetchall()
+    hosts = [row[0] for row in host_rows]
 
+    # Networks – rebuild CIDR strings
+    net_rows = conn.execute(
+        "SELECT ip, subnet FROM ip_networks WHERE version = ?;",
+        (family,),
+    ).fetchall()
+    networks = [f"{ip}/{subnet}" for ip, subnet in net_rows]
+
+    # Convert everything to ipaddress objects for filtering
+    if family == "ipv4":
+        ip_cls = ipaddress.IPv4Address
+        net_objs = [ipaddress.IPv4Network(c, strict=False) for c in networks]
+    else:
+        ip_cls = ipaddress.IPv6Address
+        net_objs = [ipaddress.IPv6Network(c, strict=False) for c in networks]
+
+    # Remove hosts that are already covered by a network
+    filtered_hosts = [h for h in hosts if not any(ip_cls(h) in net for net in net_objs)]
+
+    # Prepare final sorted list (networks first, then hosts)
+    final = sorted([str(net) for net in net_objs], reverse=True) + sorted(
+        filtered_hosts, reverse=True
+    )
+
+    with open(output_path, "w", encoding="utf-8") as f:
+        set_name = f"blocklist_{family}"
+        f.write(f"add element inet blocklists {set_name} {{\n")
+        for i, entry in enumerate(final):
+            suffix = "," if i < len(final) - 1 else ""
+            f.write(f"    {entry}{suffix}\n")
+        f.write("}\n")
+
+    print(f"{family.upper()} blocklist exported to {output_path}")
+
+
+def export_blocklist(conn: sqlite3.Connection) -> None:
+    """Export both IPv4 and IPv6 blocklists."""
+    _export_one_family(conn, "ipv4", DIR / "20-blocklist-ipv4.nft")
+    _export_one_family(conn, "ipv6", DIR / "20-blocklist-ipv6.nft")
+
+
+# ---------------------------------------------------------------------------
+# Interactive helpers
+# ---------------------------------------------------------------------------
+
+
+def read_interactive() -> set[str]:
+    """Read lines from stdin until an empty line or EOF."""
+    rows: set[str] = set()
     while True:
         try:
             line = sys.stdin.readline()
         except KeyboardInterrupt:
             sys.exit(1)
 
-        if line is None:
-            continue
-
-        # EOF (Ctrl‑D) returns '' – treat it like an empty line
-        if line == "":
+        if not line or line.rstrip("\n") == "":
             break
 
-        # Empty line (just a newline) ends input as well
-        if line.rstrip("\n") == "":
-            break
-
-        line = line.strip()
-        tokens = [_.strip() for _ in line.replace(",", " ").split() if _.strip()]
-        for token in tokens:
-            try:
-                ip = validate_ip_v4(token)
-            except ValueError as e:
-                print(f"{e} – line ignored")
-                continue
-            rows.add(ip)
-
+        tokens = [t.strip() for t in line.replace(",", " ").split() if t.strip()]
+        rows.update(tokens)
     return rows
 
 
-def validate_ip_v4(ip_str: str) -> str:
-    """Raise ValueError if `ip_str` is not a valid IPv4 address."""
-    try:
-        ipaddress.IPv4Network(ip_str, strict=False)
-        return ip_str
-    except (ipaddress.AddressValueError, ipaddress.NetmaskValueError) as exc:
-        raise ValueError(f"Invalid IPv4 address or network: {ip_str}") from exc
+# ---------------------------------------------------------------------------
+# CLI entry point
+# ---------------------------------------------------------------------------
 
 
-def main():
+def main() -> None:
     parser = argparse.ArgumentParser(
         description=(
-            "Manage an IPv blocklist stored in a SQLite database. "
-            "The location of the database directory can be overridden with the "
-            "environment variable DIR (default: the script's directory)."
+            "Manage an IP blocklist (IPv4 & IPv6) stored in a SQLite database. "
+            "The DB location can be overridden with the DIR environment variable."
         ),
         epilog=f"[DIR]: {DIR}, [DB_PATH]: {DB_PATH}",
     )
@@ -225,54 +426,47 @@ def main():
         "--add",
         dest="add_ip",
         metavar="IP",
-        help="Add a single IP address (metadata optional via -m).",
+        help="Add a single IP address or network.",
     )
     group.add_argument(
         "-A",
         "--batch-add",
         dest="batch_add",
         action="store_true",
-        help="Add many IPs from stdin (empty line / Ctrl‑D ends).",
+        help="Add many IPs/networks from stdin.",
     )
     group.add_argument(
         "-r",
         "--remove",
         dest="remove_ip",
         metavar="IP",
-        help="Remove a single IP address.",
+        help="Remove a single IP address (hosts only).",
     )
     group.add_argument(
         "-R",
         "--batch-remove",
         dest="batch_remove",
         action="store_true",
-        help="Read many IPs from stdin (empty line / Ctrl‑D ends) and delete them.",
+        help="Remove many IPs from stdin.",
     )
     parser.add_argument(
         "-m",
         "--metadata",
         dest="metadata",
         default=None,
-        help="If supplied, this string will be stored as the metadata for EVERY IP "
-        "added (overrides per‑line comments).",
+        help="Metadata stored for every added host IP.",
     )
     parser.add_argument(
         "-e",
         "--export",
         dest="export",
         action="store_true",
-        help="Export all stored IPs to 20-blocklist-ipv4.nft (nftables format).",
+        help="Export blocklists to nftables files.",
     )
     args = parser.parse_args()
 
     if not any(
-        (
-            args.add_ip,
-            args.batch_add,
-            args.remove_ip,
-            args.batch_remove,
-            args.export,
-        )
+        (args.add_ip, args.batch_add, args.remove_ip, args.batch_remove, args.export)
     ):
         parser.print_help()
         return
@@ -280,43 +474,38 @@ def main():
     with sqlite3.connect(DB_PATH, detect_types=sqlite3.PARSE_DECLTYPES) as conn:
         init_db(conn)
 
-        # ---------- Export blocklist ----------
         if args.export:
             export_blocklist(conn)
             return
 
-        # ---------- Single‑add ----------
         if args.add_ip:
-            ip = validate_ip_v4(args.add_ip)
-            insert_ip4(conn, ip, args.metadata)
+            ip_norm, ver = validate_ip(args.add_ip)
+            insert_ip(conn, ip_norm, ver, args.metadata)
             export_blocklist(conn)
             return
 
-        # ---------- Batch‑add ----------
         if args.batch_add:
             ipset = read_interactive()
-            if not ipset:
-                print("No valid IPs read – nothing to add.")
-                return
-            batch_insert_ip4(conn, ipset, args.metadata)
-            export_blocklist(conn)
+            if ipset:
+                batch_insert_ip(conn, ipset, args.metadata)
+                export_blocklist(conn)
+            else:
+                print("No IPs read – nothing to add.")
             return
 
-        # ---------- Single‑remove ----------
         if args.remove_ip:
-            ip = validate_ip_v4(args.remove_ip)
-            remove_ip4(conn, ip)
+            remove_ip(conn, args.remove_ip)
             export_blocklist(conn)
             return
 
-        # ---------- Batch‑remove ----------
         if args.batch_remove:
             ipset = read_interactive()
-            if not ipset:
-                print("No valid IPs read – nothing to remove.")
-                return
-            batch_remove_ip4(conn, ipset)
-            export_blocklist(conn)
+            if ipset:
+                batch_remove_ip(conn, ipset)
+                export_blocklist(conn)
+            else:
+                print("No IPs read – nothing to remove.")
+            return
 
 
 if __name__ == "__main__":
