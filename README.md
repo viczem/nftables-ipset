@@ -93,7 +93,7 @@ flush ruleset
 include "/etc/nftables.d/*.nft"
 ```
 
-The `include` line automatically picks up both `10‑blocklist.nft` and `20‑blocklist‑ipv4.nft`.
+The `include` line automatically picks up both `10‑blocklist.nft` and `20‑blocklist‑ipv4.nft` (`20‑blocklist‑ipv6.nft`).
 When you run `nftables-ipset --export`, the generated file is **overwritten** in place, so the next `nft -f /etc/nftables.conf` reload picks up the new list.
 
 ## Usage
@@ -103,30 +103,27 @@ uv run nftables-ipset -h
 ```
 
 ```plain
-usage: nftables-ipset [-h] [-a IP] [-A] [-r IP] [-R] [-m METADATA] [-e]
+usage: nftables-ipset [-h] [-a IP | -A | -r IP | -R] [-c COMMENT] [-e]
 
-Manage an IP blocklist stored in a SQLite database. The location of the
-database directory can be overridden with the environment variable DIR
-(default: the script's directory).
+Manage an IP blocklist (IPv4 & IPv6) stored in a SQLite database. The DB location can be overridden with the DIR environment variable.
 
 options:
   -h, --help            show this help message and exit
-  -a IP, --add IP       Add a single IP address (metadata optional via -m).
-  -A, --batch-add       Add many IPs from stdin (empty line / Ctrl‑D ends).
-  -r IP, --remove IP    Remove a single IP address.
-  -R, --batch-remove    Read many IPs from stdin (empty line / Ctrl‑D ends) and delete them.
-  -m METADATA, --metadata METADATA
-                        If supplied, this string will be stored as the metadata
-                        for EVERY IP added (overrides per‑line comments).
-  -e, --export          Export all stored IPs to 20-blocklist-ipv4.nft (nftables format).
+  -a, --add IP          Add a single IP address or network.
+  -A, --batch-add       Add many IPs/networks from stdin.
+  -r, --remove IP       Remove a single IP address (hosts only).
+  -R, --batch-remove    Remove many IPs from stdin.
+  -c, --comment COMMENT
+                        Comment stored for every added host IP.
+  -e, --export          Export blocklists to nftables files.
 ```
 
 ### Adding a single address
 
 ```bash
 uv run nftables-ipset --add 203.0.113.45
-# with metadata (e.g., source of the block)
-uv run nftables-ipset --add 203.0.113.45 --metadata "spam‑source:spamhaus"
+# with comments (e.g., source of the block)
+uv run nftables-ipset --add 203.0.113.45 --comment "spam‑source:spamhaus"
 ```
 
 ### Adding many addresses (batch mode)
@@ -142,7 +139,7 @@ curl -s https://example.com/blocked.txt | uv run nftables-ipset --batch-add
 *Batch mode reads one IP per line. An empty line or `Ctrl‑D` ends the input.*
 
 If the input file contains **comments** (anything after a `#`), they are stripped automatically.
-If you want **the same metadata** for every line, pass `-m "your‑note"`; it overrides per‑line comments.
+If you want **the same comments** for every line, pass `-c "your‑note"`; it overrides per‑line comments.
 
 ### Removing a single address
 
@@ -165,10 +162,9 @@ uv run nftables-ipset --export
 The command:
 
 1. Reads **all rows** from the database.
-2. Writes them into `20-blocklist-ipv4.nft` **in the same directory as the script** (or `DIR` if set).
-3. Copies the file to `/etc/nftables.d/20-blocklist-ipv4.nft` (requires root permissions).
+2. Writes them into `20-blocklist-ipv4.nft` (or/and `20-blocklist-ipv6.nft`) **in the same directory as the script** (or `DIR` if set).
 
-After export you typically reload nftables:
+After export copy the file to `/etc/nftables.d/20-blocklist-ipv4.nft` (requires root permissions) and reload nftables:
 
 ```bash
 sudo nft -f /etc/nftables.conf
