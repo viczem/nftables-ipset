@@ -3,8 +3,10 @@
   become: true
   vars:
       blocklist_src: "{{ lookup('env', 'DIR') }}/20-blocklist-ipv4.nft"
+      blocklist_src_ipv6: "{{ lookup('env', 'DIR') }}/20-blocklist-ipv6.nft"
 
       blocklist_dest: /etc/nftables.d/20-blocklist-ipv4.nft
+      blocklist_dest_ipv6: /etc/nftables.d/20-blocklist-ipv6.nft
       nft_conf: /etc/nftables.conf
 
   tasks:
@@ -16,6 +18,16 @@
             group: root
             mode: "0755"
 
+      - name: Stat IPv4 blocklist source
+        stat:
+            path: "{{ blocklist_src }}"
+        register: blocklist_ipv4_stat
+
+      - name: Stat IPv6 blocklist source
+        stat:
+            path: "{{ blocklist_src_ipv6 }}"
+        register: blocklist_ipv6_stat
+
       - name: Copy block‑list nft file from $DIR
         copy:
             src: "{{ blocklist_src }}"
@@ -23,6 +35,28 @@
             owner: root
             group: root
             mode: "0644"
+        when: blocklist_ipv4_stat.stat.exists
+
+      - name: Remove IPv4 blocklist on remote if not present locally
+        file:
+            path: "{{ blocklist_dest }}"
+            state: absent
+        when: not blocklist_ipv4_stat.stat.exists
+
+      - name: Copy IPv6 block‑list nft file from $DIR
+        copy:
+            src: "{{ blocklist_src_ipv6 }}"
+            dest: "{{ blocklist_dest_ipv6 }}"
+            owner: root
+            group: root
+            mode: "0644"
+        when: blocklist_ipv6_stat.stat.exists
+
+      - name: Remove IPv6 blocklist on remote if not present locally
+        file:
+            path: "{{ blocklist_dest_ipv6 }}"
+            state: absent
+        when: not blocklist_ipv6_stat.stat.exists
 
       - name: Apply nftables configuration
         command:

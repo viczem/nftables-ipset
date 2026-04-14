@@ -368,6 +368,19 @@ def _export_one_family(
         filtered_hosts, reverse=True
     )
 
+    if not final:
+        if output_path.is_file():
+            try:
+                output_path.unlink()
+                print(f"Removed stale {family.upper()} blocklist file {output_path}")
+            except OSError as exc:
+                print(
+                    f"Failed to remove stale {family.upper()} blocklist file {output_path}: {exc}"
+                )
+        else:
+            print(f"No {family.upper()} entries – no blocklist file generated.")
+        return
+
     with open(output_path, "w", encoding="utf-8") as f:
         set_name = f"blocklist_{family}"
         f.write(f"add element inet blocklists {set_name} {{\n")
