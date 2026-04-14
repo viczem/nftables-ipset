@@ -289,6 +289,56 @@ class TestCliZeroDependency(unittest.TestCase):
         # The IPv6 blocklist file must have been removed.
         self.assertFalse(nft_file.exists())
 
+    def test_add_ipv4_with_comment(self):
+        """Add a single IPv4 host with a comment and verify it is stored.
+
+        The CLI accepts a ``-c/--comment`` flag that should be persisted in the
+        ``comment`` column of the ``ip_addresses`` table.  The comment is not
+        exported to the ``.nft`` file (the current implementation only writes
+        the IP address), but the presence of the flag must not break the
+        insertion logic.
+        """
+        comment = "blocked because of abuse"
+        result = _run_cli(["-a", "203.0.113.42", "-c", comment], self.temp_dir)
+        self.assertEqual(result.returncode, 0, msg=result.stderr)
+
+        with self._open_db() as conn:
+            row = conn.execute(
+                "SELECT ip, version, comment FROM ip_addresses WHERE ip = ?",
+                ("203.0.113.42",),
+            ).fetchone()
+        self.assertIsNotNone(row)
+        self.assertEqual(row, ("203.0.113.42", "ipv4", comment))
+
+        # The blocklist file should still be generated and contain the IP.
+        nft_file = self.temp_dir / "20-blocklist-ipv4.nft"
+        self.assertTrue(nft_file.is_file())
+        self.assertIn("203.0.113.42", nft_file.read_text(encoding="utf-8"))
+
+    def test_add_ipv4_network_with_comment(self):
+        """Add a single IPv4 network with a comment and verify persistence.
+
+        The comment should be stored in the ``comment`` column of the
+        ``ip_networks`` table.  As with host comments, it is not exported to the
+        nft file, but the insertion must succeed without affecting the export.
+        """
+        comment = "spam source"
+        result = _run_cli(["-a", "198.51.100.0/24", "-c", comment], self.temp_dir)
+        self.assertEqual(result.returncode, 0, msg=result.stderr)
+
+        with self._open_db() as conn:
+            row = conn.execute(
+                "SELECT ip, subnet, version, comment FROM ip_networks WHERE ip = ?",
+                ("198.51.100.0",),
+            ).fetchone()
+        self.assertIsNotNone(row)
+        # Expected tuple: (ip, subnet, version, comment)
+        self.assertEqual(row, ("198.51.100.0", 24, "ipv4", comment))
+
+        nft_file = self.temp_dir / "20-blocklist-ipv4.nft"
+        self.assertTrue(nft_file.is_file())
+        self.assertIn("198.51.100.0/24", nft_file.read_text(encoding="utf-8"))
+
 
 if __name__ == "__main__":
     unittest.main()

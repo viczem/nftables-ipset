@@ -43,7 +43,8 @@ def init_db(conn: sqlite3.Connection) -> None:
             ip         TEXT    NOT NULL UNIQUE,
             version    TEXT    NOT NULL,   -- 'ipv4' or 'ipv6'
             created_at DATETIME DEFAULT (datetime('now')) NOT NULL,
-            metadata   TEXT
+            comment    TEXT,
+            PRIMARY KEY (ip, version)
         );
         """
     )
@@ -51,11 +52,12 @@ def init_db(conn: sqlite3.Connection) -> None:
     conn.execute(
         """
         CREATE TABLE IF NOT EXISTS ip_networks (
-            ip         TEXT    NOT NULL,
+            ip         TEXT    NOT NULL UNIQUE,
             version    TEXT    NOT NULL,   -- 'ipv4' or 'ipv6'
             subnet     INTEGER NOT NULL,   -- prefix length
             created_at DATETIME DEFAULT (datetime('now')) NOT NULL,
             updated_at DATETIME DEFAULT (datetime('now')) NOT NULL,
+            comment    TEXT,
             PRIMARY KEY (ip, version)
         );
         """
@@ -65,7 +67,9 @@ def init_db(conn: sqlite3.Connection) -> None:
     conn.execute("PRAGMA synchronous=NORMAL;")
 
 
-def _insert_network(conn: sqlite3.Connection, net_str: str, version: str) -> None:
+def _insert_network(
+    conn: sqlite3.Connection, net_str: str, version: str, comment: str | None
+) -> None:
     net = ipaddress.ip_network(net_str, strict=False)
     base_ip = str(net.network_address)
     prefix = net.prefixlen
@@ -107,35 +111,36 @@ def _insert_network(conn: sqlite3.Connection, net_str: str, version: str) -> Non
 
     # Insert or update the exact network entry
     cur.execute(
-        "SELECT subnet FROM ip_networks WHERE ip = ? AND version = ?;",
+        "SELECT subnet, comment FROM ip_networks WHERE ip = ? AND version = ?;",
         (base_ip, version),
     )
     row = cur.fetchone()
     if row is None:
         cur.execute(
-            "INSERT INTO ip_networks (ip, version, subnet) VALUES (?, ?, ?);",
-            (base_ip, version, prefix),
+            "INSERT INTO ip_networks (ip, version, subnet, comment) VALUES (?, ?, ?, ?);",
+            (base_ip, version, prefix, comment),
         )
         conn.commit()
         print(f"Inserted network {base_ip}/{prefix} ({version})")
     else:
-        existing = row[0]
-        if prefix < existing:
+        existing_sub = row[0]
+        existing_comment = row[1]
+        if prefix < existing_sub:
             cur.execute(
                 """
                 UPDATE ip_networks
-                SET subnet = ?, updated_at = datetime('now')
+                SET subnet = ?, updated_at = datetime('now'), comment = ?
                 WHERE ip = ? AND version = ?;
                 """,
-                (prefix, base_ip, version),
+                (prefix, base_ip, version, comment if comment else existing_comment),
             )
             conn.commit()
             print(
-                f"Updated network {base_ip}/{existing} -> {base_ip}/{prefix} ({version})"
+                f"Updated network {base_ip}/{existing_sub} -> {base_ip}/{prefix} ({version})"
             )
         else:
             print(
-                f"Ignored network {base_ip}/{prefix}; existing /{existing} is broader."
+                f"Ignored network {base_ip}/{prefix}; existing /{existing_sub} is broader."
             )
 
 
@@ -166,20 +171,20 @@ def validate_ip(ip_str: str) -> tuple[str, str]:
 
 
 def insert_ip(
-    conn: sqlite3.Connection, ip: str, version: str, metadata: str | None
+    conn: sqlite3.Connection, ip: str, version: str, comment: str | None
 ) -> None:
     """
     Insert a host IP or delegate to ``_insert_network`` when a CIDR is supplied.
     """
     if "/" in ip:
-        _insert_network(conn, ip, version)
+        _insert_network(conn, ip, version, comment)
         return
 
     cur = conn.cursor()
     try:
         cur.execute(
-            "INSERT OR IGNORE INTO ip_addresses (ip, version, metadata) VALUES (?, ?, ?);",
-            (ip, version, metadata),
+            "INSERT OR IGNORE INTO ip_addresses (ip, version, comment) VALUES (?, ?, ?);",
+            (ip, version, comment),
         )
         conn.commit()
         print(f"Inserted {ip} ({version})")
@@ -188,7 +193,7 @@ def insert_ip(
 
 
 def batch_insert_ip(
-    conn: sqlite3.Connection, rows: set[str], metadata: str | None
+    conn: sqlite3.Connection, rows: set[str], comment: str | None
 ) -> int:
     """
     Insert many entries. Networks are handled individually (because they need
@@ -208,7 +213,7 @@ def batch_insert_ip(
             continue
 
         if "/" in ip_norm:
-            _insert_network(conn, ip_norm, ver)
+            _insert_network(conn, ip_norm, ver, comment)
         else:
             hosts_to_insert.append((ip_norm, ver))
 
@@ -217,8 +222,8 @@ def batch_insert_ip(
         conn.execute("BEGIN;")
         try:
             conn.executemany(
-                "INSERT OR IGNORE INTO ip_addresses (ip, version, metadata) VALUES (?, ?, ?);",
-                ((ip, ver, metadata) for ip, ver in hosts_to_insert),
+                "INSERT OR IGNORE INTO ip_addresses (ip, version, comment) VALUES (?, ?, ?);",
+                ((ip, ver, comment) for ip, ver in hosts_to_insert),
             )
         except sqlite3.DatabaseError as e:
             conn.rollback()
@@ -463,11 +468,11 @@ def main() -> None:
         help="Remove many IPs from stdin.",
     )
     parser.add_argument(
-        "-m",
-        "--metadata",
-        dest="metadata",
+        "-c",
+        "--comment",
+        dest="comment",
         default=None,
-        help="Metadata stored for every added host IP.",
+        help="Comment stored for every added host IP.",
     )
     parser.add_argument(
         "-e",
@@ -493,14 +498,14 @@ def main() -> None:
 
         if args.add_ip:
             ip_norm, ver = validate_ip(args.add_ip)
-            insert_ip(conn, ip_norm, ver, args.metadata)
+            insert_ip(conn, ip_norm, ver, args.comment)
             export_blocklist(conn)
             return
 
         if args.batch_add:
             ipset = read_interactive()
             if ipset:
-                batch_insert_ip(conn, ipset, args.metadata)
+                batch_insert_ip(conn, ipset, args.comment)
                 export_blocklist(conn)
             else:
                 print("No IPs read – nothing to add.")
