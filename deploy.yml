@@ -22,11 +22,15 @@
         stat:
             path: "{{ blocklist_src }}"
         register: blocklist_ipv4_stat
+        delegate_to: localhost
+        become: false
 
       - name: Stat IPv6 blocklist source
         stat:
             path: "{{ blocklist_src_ipv6 }}"
         register: blocklist_ipv6_stat
+        delegate_to: localhost
+        become: false
 
       - name: Copy block‑list nft file from $DIR
         copy:
