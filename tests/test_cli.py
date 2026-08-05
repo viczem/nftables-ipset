@@ -64,7 +64,13 @@ class TestCliZeroDependency(unittest.TestCase):
 
         nft_file = self.temp_dir / "20-blocklist-ipv4.nft"
         self.assertTrue(nft_file.is_file())
-        self.assertIn("192.0.2.1", nft_file.read_text(encoding="utf-8"))
+        self.assertEqual(
+            nft_file.read_text(encoding="utf-8"),
+            "flush set inet blocklists blocklist_ipv4\n"
+            "add element inet blocklists blocklist_ipv4 {\n"
+            "    192.0.2.1\n"
+            "}\n",
+        )
 
     def test_add_single_ipv6(self):
         result = _run_cli(["-a", "2001:db8::1"], self.temp_dir)
@@ -80,7 +86,13 @@ class TestCliZeroDependency(unittest.TestCase):
 
         nft_file = self.temp_dir / "20-blocklist-ipv6.nft"
         self.assertTrue(nft_file.is_file())
-        self.assertIn("2001:db8::1", nft_file.read_text(encoding="utf-8"))
+        self.assertEqual(
+            nft_file.read_text(encoding="utf-8"),
+            "flush set inet blocklists blocklist_ipv6\n"
+            "add element inet blocklists blocklist_ipv6 {\n"
+            "    2001:db8::1\n"
+            "}\n",
+        )
 
     def test_add_ipv4_network(self):
         result = _run_cli(["-a", "198.51.100.0/24"], self.temp_dir)

@@ -66,6 +66,7 @@ table inet blocklists {
 **20‑blocklist‑ipv4.nft** (generated)
 
 ```nft
+flush set inet blocklists blocklist_ipv4
 add element inet blocklists blocklist_ipv4 {
     1.1.1.1,
     2.2.2.2,
@@ -73,9 +74,10 @@ add element inet blocklists blocklist_ipv4 {
 }
 ```
 
-**20‑blocklist‑ipv4.nft** (generated)
+**20‑blocklist‑ipv6.nft** (generated)
 
 ```nft
+flush set inet blocklists blocklist_ipv6
 add element inet blocklists blocklist_ipv6 {
     2001:db8::/32,
     2606:4700:4700::1111,
@@ -88,13 +90,13 @@ add element inet blocklists blocklist_ipv6 {
 ```bash
 #!/usr/sbin/nft -f
 
-flush ruleset
 #...
 include "/etc/nftables.d/*.nft"
 ```
 
 The `include` line automatically picks up both `10‑blocklist.nft` and `20‑blocklist‑ipv4.nft` (`20‑blocklist‑ipv6.nft`).
 When you run `nftables-ipset --export`, the generated file is **overwritten** in place, so the next `nft -f /etc/nftables.conf` reload picks up the new list.
+Each generated file flushes only its own blocklist set before adding the current entries. Do not use `flush ruleset` in `/etc/nftables.conf`, because it removes rules installed by running Docker containers.
 
 ## Usage
 

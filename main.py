@@ -388,6 +388,7 @@ def _export_one_family(
 
     with open(output_path, "w", encoding="utf-8") as f:
         set_name = f"blocklist_{family}"
+        f.write(f"flush set inet blocklists {set_name}\n")
         f.write(f"add element inet blocklists {set_name} {{\n")
         for i, entry in enumerate(final):
             suffix = "," if i < len(final) - 1 else ""
