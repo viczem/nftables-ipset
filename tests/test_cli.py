@@ -6,7 +6,9 @@ import unittest
 from pathlib import Path
 
 
-def _run_cli(args: list[str], dir_path: Path) -> subprocess.CompletedProcess:
+def _run_cli(
+    args: list[str], dir_path: Path, input_text: str | None = None
+) -> subprocess.CompletedProcess:
     """
     Execute the CLI entry point using ``uv run`` with the ``DIR`` environment
     variable pointing at ``dir_path`` (a temporary directory that holds the
@@ -26,6 +28,7 @@ def _run_cli(args: list[str], dir_path: Path) -> subprocess.CompletedProcess:
         env=env,
         capture_output=True,
         text=True,
+        input=input_text,
     )
 
 
@@ -109,6 +112,164 @@ class TestCliZeroDependency(unittest.TestCase):
         nft_file = self.temp_dir / "20-blocklist-ipv4.nft"
         self.assertTrue(nft_file.is_file())
         self.assertIn("198.51.100.0/24", nft_file.read_text(encoding="utf-8"))
+
+    def test_exclude_ipv4_with_comment(self):
+        comment = "must remain reachable"
+        result = _run_cli(
+            ["-x", "203.0.113.20", "-c", comment], self.temp_dir
+        )
+        self.assertEqual(result.returncode, 0, msg=result.stderr)
+
+        with self._open_db() as conn:
+            row = conn.execute(
+                "SELECT ip, version, comment FROM ip_addresses_exclude WHERE ip = ?",
+                ("203.0.113.20",),
+            ).fetchone()
+        self.assertEqual(row, ("203.0.113.20", "ipv4", comment))
+
+    def test_exclude_rejects_cidr(self):
+        result = _run_cli(["-x", "203.0.113.0/24"], self.temp_dir)
+
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("CIDR networks cannot be added to exclude", result.stderr)
+        with self._open_db() as conn:
+            count = conn.execute(
+                "SELECT COUNT(*) FROM ip_addresses_exclude"
+            ).fetchone()[0]
+        self.assertEqual(count, 0)
+
+    def test_exclude_rejects_blocked_host(self):
+        add_result = _run_cli(["-a", "203.0.113.30"], self.temp_dir)
+        self.assertEqual(add_result.returncode, 0, msg=add_result.stderr)
+
+        result = _run_cli(["-x", "203.0.113.30"], self.temp_dir)
+
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("it is blocked by 203.0.113.30", result.stderr)
+        with self._open_db() as conn:
+            row = conn.execute(
+                "SELECT ip FROM ip_addresses_exclude WHERE ip = ?",
+                ("203.0.113.30",),
+            ).fetchone()
+        self.assertIsNone(row)
+
+    def test_exclude_rejects_ip_inside_blocked_network(self):
+        add_result = _run_cli(["-a", "198.51.100.0/24"], self.temp_dir)
+        self.assertEqual(add_result.returncode, 0, msg=add_result.stderr)
+
+        result = _run_cli(["-x", "198.51.100.42"], self.temp_dir)
+
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("it is blocked by 198.51.100.0/24", result.stderr)
+
+    def test_batch_exclude_skips_conflicts_and_cidr(self):
+        add_host = _run_cli(["-a", "203.0.113.40"], self.temp_dir)
+        self.assertEqual(add_host.returncode, 0, msg=add_host.stderr)
+        add_network = _run_cli(["-a", "2001:db8:1::/48"], self.temp_dir)
+        self.assertEqual(add_network.returncode, 0, msg=add_network.stderr)
+
+        result = _run_cli(
+            ["-X", "-c", "protected"],
+            self.temp_dir,
+            "192.0.2.10\n203.0.113.40\n2001:db8:1::5\n192.0.2.0/24\n2001:db8::10\n",
+        )
+
+        self.assertEqual(result.returncode, 0, msg=result.stderr)
+        self.assertIn("Warning: 203.0.113.40 was not excluded", result.stdout)
+        self.assertIn("Warning: 2001:db8:1::5 was not excluded", result.stdout)
+        self.assertIn("CIDR networks cannot be added to exclude", result.stdout)
+        with self._open_db() as conn:
+            rows = conn.execute(
+                "SELECT ip, version, comment FROM ip_addresses_exclude ORDER BY ip"
+            ).fetchall()
+        self.assertEqual(
+            rows,
+            [
+                ("192.0.2.10", "ipv4", "protected"),
+                ("2001:db8::10", "ipv6", "protected"),
+            ],
+        )
+
+    def test_excluded_ip_cannot_be_added_to_blocklist(self):
+        exclude_result = _run_cli(["-x", "203.0.113.50"], self.temp_dir)
+        self.assertEqual(exclude_result.returncode, 0, msg=exclude_result.stderr)
+
+        host_result = _run_cli(["-a", "203.0.113.50"], self.temp_dir)
+        network_result = _run_cli(["-a", "203.0.113.0/24"], self.temp_dir)
+
+        self.assertNotEqual(host_result.returncode, 0)
+        self.assertNotEqual(network_result.returncode, 0)
+        self.assertIn("excluded IP 203.0.113.50", host_result.stderr)
+        self.assertIn("excluded IP 203.0.113.50", network_result.stderr)
+        with self._open_db() as conn:
+            host_count = conn.execute("SELECT COUNT(*) FROM ip_addresses").fetchone()[0]
+            network_count = conn.execute("SELECT COUNT(*) FROM ip_networks").fetchone()[0]
+        self.assertEqual(host_count, 0)
+        self.assertEqual(network_count, 0)
+
+    def test_batch_add_skips_entries_covering_excluded_ip(self):
+        exclude_result = _run_cli(["-x", "2001:db8::20"], self.temp_dir)
+        self.assertEqual(exclude_result.returncode, 0, msg=exclude_result.stderr)
+
+        result = _run_cli(
+            ["-A"],
+            self.temp_dir,
+            "2001:db8::20\n2001:db8::/64\n2001:db9::20\n",
+        )
+
+        self.assertEqual(result.returncode, 0, msg=result.stderr)
+        self.assertIn("contains excluded IP 2001:db8::20", result.stdout)
+        with self._open_db() as conn:
+            rows = conn.execute(
+                "SELECT ip FROM ip_addresses WHERE version = 'ipv6'"
+            ).fetchall()
+            networks = conn.execute(
+                "SELECT ip FROM ip_networks WHERE version = 'ipv6'"
+            ).fetchall()
+        self.assertEqual(rows, [("2001:db9::20",)])
+        self.assertEqual(networks, [])
+
+    def test_remove_deletes_excluded_ip(self):
+        exclude_result = _run_cli(["-x", "192.0.2.60"], self.temp_dir)
+        self.assertEqual(exclude_result.returncode, 0, msg=exclude_result.stderr)
+
+        remove_result = _run_cli(["-r", "192.0.2.60"], self.temp_dir)
+
+        self.assertEqual(remove_result.returncode, 0, msg=remove_result.stderr)
+        with self._open_db() as conn:
+            row = conn.execute(
+                "SELECT ip FROM ip_addresses_exclude WHERE ip = ?",
+                ("192.0.2.60",),
+            ).fetchone()
+        self.assertIsNone(row)
+
+    def test_remove_matches_equivalent_ipv6_spelling(self):
+        add_result = _run_cli(["-a", "2001:0db8::60"], self.temp_dir)
+        self.assertEqual(add_result.returncode, 0, msg=add_result.stderr)
+
+        remove_result = _run_cli(["-r", "2001:db8::60"], self.temp_dir)
+
+        self.assertEqual(remove_result.returncode, 0, msg=remove_result.stderr)
+        with self._open_db() as conn:
+            count = conn.execute("SELECT COUNT(*) FROM ip_addresses").fetchone()[0]
+        self.assertEqual(count, 0)
+
+    def test_batch_remove_deletes_excluded_ips(self):
+        exclude_result = _run_cli(
+            ["-X"], self.temp_dir, "192.0.2.70\n2001:db8::70\n"
+        )
+        self.assertEqual(exclude_result.returncode, 0, msg=exclude_result.stderr)
+
+        remove_result = _run_cli(
+            ["-R"], self.temp_dir, "192.0.2.70\n2001:db8::70\n"
+        )
+
+        self.assertEqual(remove_result.returncode, 0, msg=remove_result.stderr)
+        with self._open_db() as conn:
+            count = conn.execute(
+                "SELECT COUNT(*) FROM ip_addresses_exclude"
+            ).fetchone()[0]
+        self.assertEqual(count, 0)
 
     def test_add_ipv6_network(self):
         result = _run_cli(["-a", "2001:db8:abcd::/48"], self.temp_dir)

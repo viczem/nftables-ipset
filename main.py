@@ -26,9 +26,10 @@ DB_PATH = DIR / "nftables-ipset.db"
 def init_db(conn: sqlite3.Connection) -> None:
     """Create the required tables and set SQLite pragmas.
 
-    Two tables are used:
+    Three tables are used:
 
     * ``ip_addresses`` – stores individual host IPs.
+    * ``ip_addresses_exclude`` – stores host IPs that must not be blocked.
     * ``ip_networks`` – stores network prefixes. The ``ip`` column stores the
       network address (e.g. ``158.94.208.0``) and ``subnet`` stores the prefix
       length (e.g. ``24``). ``updated_at`` is refreshed when the stored prefix
@@ -40,6 +41,18 @@ def init_db(conn: sqlite3.Connection) -> None:
     conn.execute(
         """
         CREATE TABLE IF NOT EXISTS ip_addresses (
+            ip         TEXT    NOT NULL UNIQUE,
+            version    TEXT    NOT NULL,   -- 'ipv4' or 'ipv6'
+            created_at DATETIME DEFAULT (datetime('now')) NOT NULL,
+            comment    TEXT,
+            PRIMARY KEY (ip, version)
+        );
+        """
+    )
+    # Hosts that must never be added to the blocklist
+    conn.execute(
+        """
+        CREATE TABLE IF NOT EXISTS ip_addresses_exclude (
             ip         TEXT    NOT NULL UNIQUE,
             version    TEXT    NOT NULL,   -- 'ipv4' or 'ipv6'
             created_at DATETIME DEFAULT (datetime('now')) NOT NULL,
@@ -68,7 +81,11 @@ def init_db(conn: sqlite3.Connection) -> None:
 
 
 def _insert_network(
-    conn: sqlite3.Connection, net_str: str, version: str, comment: str | None
+    conn: sqlite3.Connection,
+    net_str: str,
+    version: str,
+    comment: str | None,
+    commit: bool = True,
 ) -> None:
     net = ipaddress.ip_network(net_str, strict=False)
     base_ip = str(net.network_address)
@@ -91,7 +108,8 @@ def _insert_network(
             print(
                 f"Ignored network {base_ip}/{prefix}; covered by existing {existing_ip}/{existing_prefix} ({version})"
             )
-            conn.commit()
+            if commit:
+                conn.commit()
             return
 
     # Delete any existing networks that are subnets of the new network (more specific)
@@ -120,7 +138,8 @@ def _insert_network(
             "INSERT INTO ip_networks (ip, version, subnet, comment) VALUES (?, ?, ?, ?);",
             (base_ip, version, prefix, comment),
         )
-        conn.commit()
+        if commit:
+            conn.commit()
         print(f"Inserted network {base_ip}/{prefix} ({version})")
     else:
         existing_sub = row[0]
@@ -134,7 +153,8 @@ def _insert_network(
                 """,
                 (prefix, base_ip, version, comment if comment else existing_comment),
             )
-            conn.commit()
+            if commit:
+                conn.commit()
             print(
                 f"Updated network {base_ip}/{existing_sub} -> {base_ip}/{prefix} ({version})"
             )
@@ -142,6 +162,8 @@ def _insert_network(
             print(
                 f"Ignored network {base_ip}/{prefix}; existing /{existing_sub} is broader."
             )
+            if commit:
+                conn.commit()
 
 
 # ---------------------------------------------------------------------------
@@ -165,6 +187,77 @@ def validate_ip(ip_str: str) -> tuple[str, str]:
     return ip_str, version
 
 
+def validate_host_ip(ip_str: str) -> tuple[str, str]:
+    """Validate and normalize an individual IPv4 or IPv6 address."""
+    if "/" in ip_str:
+        raise ValueError(f"CIDR networks cannot be added to exclude: {ip_str}")
+
+    try:
+        address = ipaddress.ip_address(ip_str)
+    except ValueError as exc:
+        raise ValueError(f"Invalid IP address: {ip_str}") from exc
+
+    version = "ipv4" if address.version == 4 else "ipv6"
+    return str(address), version
+
+
+def _find_blocklist_conflict(
+    conn: sqlite3.Connection, ip: str, version: str
+) -> str | None:
+    """Return the blocklist entry that contains an address, if any."""
+    address = ipaddress.ip_address(ip)
+
+    host_rows = conn.execute(
+        "SELECT ip FROM ip_addresses WHERE version = ?;", (version,)
+    ).fetchall()
+    for (blocked_ip,) in host_rows:
+        if ipaddress.ip_address(blocked_ip) == address:
+            return blocked_ip
+
+    network_rows = conn.execute(
+        "SELECT ip, subnet FROM ip_networks WHERE version = ?;", (version,)
+    ).fetchall()
+    for network_ip, prefix in network_rows:
+        network = ipaddress.ip_network(f"{network_ip}/{prefix}", strict=False)
+        if address in network:
+            return str(network)
+
+    return None
+
+
+def _find_exclude_conflict(
+    conn: sqlite3.Connection, ip: str, version: str
+) -> str | None:
+    """Return an excluded host covered by a blocklist candidate, if any."""
+    candidate = ipaddress.ip_network(ip, strict=False)
+    rows = conn.execute(
+        "SELECT ip FROM ip_addresses_exclude WHERE version = ?;", (version,)
+    ).fetchall()
+    for (excluded_ip,) in rows:
+        if ipaddress.ip_address(excluded_ip) in candidate:
+            return excluded_ip
+
+    return None
+
+
+def _matching_host_rows(
+    conn: sqlite3.Connection, table: str, ip: str, version: str
+) -> list[tuple[str, str]]:
+    """Return stored host rows that are semantically equal to an address."""
+    if table not in {"ip_addresses", "ip_addresses_exclude"}:
+        raise ValueError(f"Unsupported host table: {table}")
+
+    address = ipaddress.ip_address(ip)
+    rows = conn.execute(
+        f"SELECT ip FROM {table} WHERE version = ?;", (version,)
+    ).fetchall()
+    return [
+        (stored_ip, version)
+        for (stored_ip,) in rows
+        if ipaddress.ip_address(stored_ip) == address
+    ]
+
+
 # ---------------------------------------------------------------------------
 # CRUD operations
 # ---------------------------------------------------------------------------
@@ -176,24 +269,33 @@ def insert_ip(
     """
     Insert a host IP or delegate to ``_insert_network`` when a CIDR is supplied.
     """
-    if "/" in ip:
-        _insert_network(conn, ip, version, comment)
-        return
-
-    cur = conn.cursor()
+    conn.execute("BEGIN IMMEDIATE;")
     try:
+        excluded_ip = _find_exclude_conflict(conn, ip, version)
+        if excluded_ip is not None:
+            raise ValueError(
+                f"Cannot add {ip} to blocklist; it contains excluded IP {excluded_ip}. "
+                "Remove the exclusion manually with --remove first."
+            )
+
+        if "/" in ip:
+            _insert_network(conn, ip, version, comment)
+            return
+
+        cur = conn.cursor()
         cur.execute(
             "INSERT OR IGNORE INTO ip_addresses (ip, version, comment) VALUES (?, ?, ?);",
             (ip, version, comment),
         )
         conn.commit()
         print(f"Inserted {ip} ({version})")
-    except sqlite3.IntegrityError:
-        print(f"IP {ip} already exists – not inserted.")
+    except (sqlite3.DatabaseError, ValueError):
+        conn.rollback()
+        raise
 
 
 def batch_insert_ip(
-    conn: sqlite3.Connection, rows: set[str], comment: str | None
+    conn: sqlite3.Connection, rows: list[str], comment: str | None
 ) -> int:
     """
     Insert many entries. Networks are handled individually (because they need
@@ -204,35 +306,112 @@ def batch_insert_ip(
         return 0
 
     hosts_to_insert: list[tuple[str, str]] = []
+    before = conn.total_changes
+    conn.execute("BEGIN IMMEDIATE;")
 
-    for raw in rows:
-        try:
-            ip_norm, ver = validate_ip(raw)
-        except ValueError as e:
-            print(f"{e} – line ignored")
-            continue
+    try:
+        for raw in rows:
+            try:
+                ip_norm, ver = validate_ip(raw)
+            except ValueError as e:
+                print(f"{e} – line ignored")
+                continue
 
-        if "/" in ip_norm:
-            _insert_network(conn, ip_norm, ver, comment)
-        else:
-            hosts_to_insert.append((ip_norm, ver))
+            excluded_ip = _find_exclude_conflict(conn, ip_norm, ver)
+            if excluded_ip is not None:
+                print(
+                    f"Warning: {ip_norm} was not added to blocklist because it "
+                    f"contains excluded IP {excluded_ip}. Remove the exclusion "
+                    "manually with --remove first."
+                )
+                continue
 
-    # Bulk insert hosts
-    if hosts_to_insert:
-        conn.execute("BEGIN;")
-        try:
+            if "/" in ip_norm:
+                _insert_network(conn, ip_norm, ver, comment, commit=False)
+            else:
+                hosts_to_insert.append((ip_norm, ver))
+
+        if hosts_to_insert:
             conn.executemany(
                 "INSERT OR IGNORE INTO ip_addresses (ip, version, comment) VALUES (?, ?, ?);",
                 ((ip, ver, comment) for ip, ver in hosts_to_insert),
             )
-        except sqlite3.DatabaseError as e:
-            conn.rollback()
-            raise RuntimeError(f"Batch insert failed: {e}") from e
-        else:
-            conn.commit()
+    except sqlite3.DatabaseError as e:
+        conn.rollback()
+        raise RuntimeError(f"Batch insert failed: {e}") from e
+    else:
+        conn.commit()
 
-    inserted = conn.execute("SELECT total_changes();").fetchone()[0]
+    inserted = conn.total_changes - before
     print(f"Inserted {inserted}")
+    return inserted
+
+
+def insert_exclude(
+    conn: sqlite3.Connection, ip: str, version: str, comment: str | None
+) -> None:
+    """Add a host IP to the exclude list after checking the blocklist."""
+    conn.execute("BEGIN IMMEDIATE;")
+    try:
+        conflict = _find_blocklist_conflict(conn, ip, version)
+        if conflict is not None:
+            raise ValueError(
+                f"Cannot exclude {ip}; it is blocked by {conflict}. "
+                "Remove that blocklist entry manually, then repeat the command."
+            )
+
+        before = conn.total_changes
+        conn.execute(
+            "INSERT OR IGNORE INTO ip_addresses_exclude (ip, version, comment) VALUES (?, ?, ?);",
+            (ip, version, comment),
+        )
+        conn.commit()
+    except (sqlite3.DatabaseError, ValueError):
+        conn.rollback()
+        raise
+    if conn.total_changes > before:
+        print(f"Inserted excluded IP {ip} ({version})")
+    else:
+        print(f"Excluded IP {ip} ({version}) already exists – not inserted.")
+
+
+def batch_insert_exclude(
+    conn: sqlite3.Connection, rows: list[str], comment: str | None
+) -> int:
+    """Add valid, unblocked host IPs to the exclude list in input order."""
+    inserted = 0
+    conn.execute("BEGIN IMMEDIATE;")
+    try:
+        for raw in rows:
+            try:
+                ip_norm, ver = validate_host_ip(raw)
+            except ValueError as exc:
+                print(f"Warning: {exc} – line ignored")
+                continue
+
+            conflict = _find_blocklist_conflict(conn, ip_norm, ver)
+            if conflict is not None:
+                print(
+                    f"Warning: {ip_norm} was not excluded because it is blocked by "
+                    f"{conflict}. Remove that blocklist entry manually, then repeat "
+                    "the command."
+                )
+                continue
+
+            before = conn.total_changes
+            conn.execute(
+                "INSERT OR IGNORE INTO ip_addresses_exclude (ip, version, comment) VALUES (?, ?, ?);",
+                (ip_norm, ver, comment),
+            )
+            if conn.total_changes > before:
+                inserted += 1
+    except sqlite3.DatabaseError:
+        conn.rollback()
+        raise
+    else:
+        conn.commit()
+
+    print(f"Inserted excluded IPs: {inserted}")
     return inserted
 
 
@@ -268,29 +447,43 @@ def remove_ip(conn: sqlite3.Connection, ip: str) -> None:
                 f"Network {base_ip}/{net.prefixlen} ({version}) not found – nothing removed."
             )
     else:
-        cur.execute(
+        blocklist_rows = _matching_host_rows(
+            conn, "ip_addresses", ip_norm, version
+        )
+        exclude_rows = _matching_host_rows(
+            conn, "ip_addresses_exclude", ip_norm, version
+        )
+        cur.executemany(
             "DELETE FROM ip_addresses WHERE ip = ? AND version = ?;",
-            (ip_norm, version),
+            blocklist_rows,
+        )
+        cur.executemany(
+            "DELETE FROM ip_addresses_exclude WHERE ip = ? AND version = ?;",
+            exclude_rows,
         )
         conn.commit()
-        if cur.rowcount:
-            print(f"Removed {ip_norm} ({version})")
+        if blocklist_rows or exclude_rows:
+            print(
+                f"Removed {ip_norm} ({version}); blocklist: {len(blocklist_rows)}, "
+                f"exclude: {len(exclude_rows)}."
+            )
         else:
             print(f"{ip_norm} ({version}) not found – nothing removed.")
 
 
-def batch_remove_ip(conn: sqlite3.Connection, rows: set[str]) -> int:
+def batch_remove_ip(conn: sqlite3.Connection, rows: list[str]) -> int:
     """Bulk delete of host IPs **and** CIDR networks.
 
     Each entry is validated with :func:`validate_ip`.  Networks are identified
     by the presence of a ``/`` and are removed from ``ip_networks`` using the
-    network address.  Hosts are removed from ``ip_addresses``.  The function
-    returns the total number of rows removed across both tables.
+    network address. Hosts are removed from both address tables. The function
+    returns the total number of rows removed across all tables.
     """
     if not rows:
         return 0
 
-    hosts_to_delete: list[tuple[str, str]] = []
+    blocked_hosts_to_delete: list[tuple[str, str]] = []
+    excluded_hosts_to_delete: list[tuple[str, str]] = []
     nets_to_delete: list[tuple[str, str]] = []
 
     for raw in rows:
@@ -305,14 +498,24 @@ def batch_remove_ip(conn: sqlite3.Connection, rows: set[str]) -> int:
             base_ip = str(net.network_address)
             nets_to_delete.append((base_ip, ver))
         else:
-            hosts_to_delete.append((ip_norm, ver))
+            blocked_hosts_to_delete.extend(
+                _matching_host_rows(conn, "ip_addresses", ip_norm, ver)
+            )
+            excluded_hosts_to_delete.extend(
+                _matching_host_rows(conn, "ip_addresses_exclude", ip_norm, ver)
+            )
 
     conn.execute("BEGIN;")
     try:
-        if hosts_to_delete:
+        if blocked_hosts_to_delete:
             conn.executemany(
                 "DELETE FROM ip_addresses WHERE ip = ? AND version = ?;",
-                hosts_to_delete,
+                blocked_hosts_to_delete,
+            )
+        if excluded_hosts_to_delete:
+            conn.executemany(
+                "DELETE FROM ip_addresses_exclude WHERE ip = ? AND version = ?;",
+                excluded_hosts_to_delete,
             )
         if nets_to_delete:
             conn.executemany(
@@ -409,9 +612,10 @@ def export_blocklist(conn: sqlite3.Connection) -> None:
 # ---------------------------------------------------------------------------
 
 
-def read_interactive() -> set[str]:
+def read_interactive() -> list[str]:
     """Read lines from stdin until an empty line or EOF."""
-    rows: set[str] = set()
+    rows: list[str] = []
+    seen: set[str] = set()
     while True:
         try:
             line = sys.stdin.readline()
@@ -422,7 +626,10 @@ def read_interactive() -> set[str]:
             break
 
         tokens = [t.strip() for t in line.replace(",", " ").split() if t.strip()]
-        rows.update(tokens)
+        for token in tokens:
+            if token not in seen:
+                rows.append(token)
+                seen.add(token)
     return rows
 
 
@@ -455,11 +662,25 @@ def main() -> None:
         help="Add many IPs/networks from stdin.",
     )
     group.add_argument(
+        "-x",
+        "--exclude",
+        dest="exclude_ip",
+        metavar="IP",
+        help="Add a host IP to the exclude list.",
+    )
+    group.add_argument(
+        "-X",
+        "--batch-exclude",
+        dest="batch_exclude",
+        action="store_true",
+        help="Add many host IPs to the exclude list from stdin.",
+    )
+    group.add_argument(
         "-r",
         "--remove",
         dest="remove_ip",
         metavar="IP",
-        help="Remove a single IP address (hosts only).",
+        help="Remove a host IP from blocklist/exclude or remove a network.",
     )
     group.add_argument(
         "-R",
@@ -473,7 +694,7 @@ def main() -> None:
         "--comment",
         dest="comment",
         default=None,
-        help="Comment stored for every added host IP.",
+        help="Comment stored for every added or excluded host IP.",
     )
     parser.add_argument(
         "-e",
@@ -485,7 +706,15 @@ def main() -> None:
     args = parser.parse_args()
 
     if not any(
-        (args.add_ip, args.batch_add, args.remove_ip, args.batch_remove, args.export)
+        (
+            args.add_ip,
+            args.batch_add,
+            args.exclude_ip,
+            args.batch_exclude,
+            args.remove_ip,
+            args.batch_remove,
+            args.export,
+        )
     ):
         parser.print_help()
         return
@@ -498,8 +727,11 @@ def main() -> None:
             return
 
         if args.add_ip:
-            ip_norm, ver = validate_ip(args.add_ip)
-            insert_ip(conn, ip_norm, ver, args.comment)
+            try:
+                ip_norm, ver = validate_ip(args.add_ip)
+                insert_ip(conn, ip_norm, ver, args.comment)
+            except ValueError as exc:
+                parser.exit(1, f"Error: {exc}\n")
             export_blocklist(conn)
             return
 
@@ -510,6 +742,22 @@ def main() -> None:
                 export_blocklist(conn)
             else:
                 print("No IPs read – nothing to add.")
+            return
+
+        if args.exclude_ip:
+            try:
+                ip_norm, ver = validate_host_ip(args.exclude_ip)
+                insert_exclude(conn, ip_norm, ver, args.comment)
+            except ValueError as exc:
+                parser.exit(1, f"Error: {exc}\n")
+            return
+
+        if args.batch_exclude:
+            ipset = read_interactive()
+            if ipset:
+                batch_insert_exclude(conn, ipset, args.comment)
+            else:
+                print("No IPs read – nothing to exclude.")
             return
 
         if args.remove_ip:

@@ -6,8 +6,9 @@ It is deliberately minimal: one Python script, no external services, and everyth
 Typical workflow:
 
 1. **Add** single or many IP addresses (optionally with metadata).
-2. **Remove** single or many IP addresses.
-3. **Export** the whole list to a nftables‑compatible file (`20‑blocklist‑ipv4.nft`).
+2. **Exclude** host IPs that must never be blocked.
+3. **Remove** single or many IP addresses.
+4. **Export** the whole list to a nftables‑compatible file (`20‑blocklist‑ipv4.nft`).
 
 That file can be dropped into `/etc/nftables.d/` and automatically included by the global nftables configuration.
 
@@ -105,7 +106,7 @@ uv run nftables-ipset -h
 ```
 
 ```plain
-usage: nftables-ipset [-h] [-a IP | -A | -r IP | -R] [-c COMMENT] [-e]
+usage: nftables-ipset [-h] [-a IP | -A | -x IP | -X | -r IP | -R] [-c COMMENT] [-e]
 
 Manage an IP blocklist (IPv4 & IPv6) stored in a SQLite database. The DB location can be overridden with the DIR environment variable.
 
@@ -113,10 +114,12 @@ options:
   -h, --help            show this help message and exit
   -a, --add IP          Add a single IP address or network.
   -A, --batch-add       Add many IPs/networks from stdin.
-  -r, --remove IP       Remove a single IP address (hosts only).
+  -x, --exclude IP      Add a host IP to the exclude list.
+  -X, --batch-exclude   Add many host IPs to the exclude list from stdin.
+  -r, --remove IP       Remove a host IP from blocklist/exclude or remove a network.
   -R, --batch-remove    Remove many IPs from stdin.
   -c, --comment COMMENT
-                        Comment stored for every added host IP.
+                        Comment stored for every added or excluded host IP.
   -e, --export          Export blocklists to nftables files.
 ```
 
@@ -143,11 +146,36 @@ curl -s https://example.com/blocked.txt | uv run nftables-ipset --batch-add
 If the input file contains **comments** (anything after a `#`), they are stripped automatically.
 If you want **the same comments** for every line, pass `-c "your‑note"`; it overrides per‑line comments.
 
+### Excluding addresses from the blocklist
+
+Only individual host IPs can be excluded; CIDR networks are not accepted.
+
+```bash
+# Protect one address
+uv run nftables-ipset --exclude 203.0.113.10 --comment "management host"
+
+# Protect addresses read from stdin
+cat trusted_ips.txt | uv run nftables-ipset --batch-exclude --comment "trusted"
+```
+
+An address cannot be excluded while it is present in `ip_addresses` or covered
+by a network in `ip_networks`. Remove the conflicting blocklist entry manually
+with `--remove`, then repeat the exclude command. In batch mode, conflicting or
+invalid entries are reported and skipped while the remaining addresses are
+processed in input order.
+
+The reverse protection also applies when adding blocklist entries: an excluded
+IP cannot be added directly, and a CIDR network containing an excluded IP is
+rejected. `--batch-add` skips conflicting entries and continues.
+
 ### Removing a single address
 
 ```bash
 uv run nftables-ipset --remove 203.0.113.45
 ```
+
+For a host IP, `--remove` deletes the address from both the blocklist and the
+exclude list. CIDR removal only affects `ip_networks`.
 
 ### Removing many addresses (batch mode)
 
